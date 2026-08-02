@@ -1,0 +1,5 @@
+psycopg2-binary==2.9.9
+requests==2.32.3
+python-dotenv==1.0.1
+pandas-market-calendars==4.4.1
+pandas==2.2.2
