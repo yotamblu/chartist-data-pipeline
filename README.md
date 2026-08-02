@@ -103,11 +103,11 @@ partial failure never creates duplicates or corrupts data:
 ## GitHub Actions
 
 `.github/workflows/nightly-ingestion.yml` runs on a cron schedule at
-**02:00 UTC, Tuesday–Saturday**. That's always after 9pm US/Eastern for the
-preceding weekday, whether Eastern is on EST (9pm ET = 02:00 UTC) or EDT
-(9pm ET = 01:00 UTC) — 02:00 UTC is safely past market close either way.
-`main.py` itself still checks the NYSE calendar and exits cleanly on
-holidays, so the workflow doesn't need to special-case those. You can also
+**02:30 UTC, every day**. That's 9:30pm US/Eastern when Eastern is on EST,
+or 10:30pm Eastern when on EDT — either way, safely after market close.
+It runs every day (including weekends) rather than just weekdays because
+`main.py` itself checks the NYSE calendar and exits cleanly on non-trading
+days, so the workflow doesn't need to special-case those. You can also
 trigger it manually from the Actions tab (`workflow_dispatch`).
 
 ### Configuring secrets
