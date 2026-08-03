@@ -1,8 +1,8 @@
 name: Nightly Data Ingestion
 
 on:
-  schedule:
-    - cron: '30 2 * * *'   # 02:30 UTC daily = 9:30 PM ET (EST) / 8:30 PM ET (EDT)
+  # schedule disabled -- job must not run automatically until re-enabled.
+  # - cron: '30 2 * * *'   # 02:30 UTC daily = 9:30 PM ET (EST) / 8:30 PM ET (EDT)
   workflow_dispatch: {}      # lets you trigger it manually from the Actions tab for testing
 
 jobs:
