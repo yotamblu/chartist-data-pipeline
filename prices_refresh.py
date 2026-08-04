@@ -1,12 +1,20 @@
-"""Refresh `daily_prices` with today's daily bar for all active symbols.
+"""Refresh `daily_prices` with the latest daily bar for all active symbols.
 
-Fetches from Alpaca's multi-symbol bars endpoint, batched the same way as
-corporate actions, and applies the same bisect-on-400 handling for tickers
-with special characters.
+Primary path: EODHD's Bulk API (`/api/eod-bulk-last-day/US`), which returns
+the entire US market for the most recent trading day in a single request.
+
+Fallback path: if the Bulk API isn't activated on this account yet (a 403 or
+other plan-related error), loop over active symbols individually against
+`/api/eod/{ticker}.US`, scoped to the last few days (a nightly top-up, not a
+backfill), using a small thread pool. Whichever path runs is logged clearly.
+
+Stores raw open/high/low/close/volume -- NOT `adjusted_close`. This project
+stores raw prices and adjusts for splits at read time elsewhere; it never
+rewrites stored history.
 """
+import concurrent.futures
 import datetime
 import logging
-import time
 
 import psycopg2.extras
 
@@ -16,81 +24,50 @@ from trading_day import eastern_today
 
 logger = logging.getLogger("chartist.prices")
 
-_HEADERS = {
-    "APCA-API-KEY-ID": config.ALPACA_API_KEY_ID,
-    "APCA-API-SECRET-KEY": config.ALPACA_API_SECRET_KEY,
-}
+
+def _fetch_bulk_prices():
+    """Fetch the whole-market bulk EOD file. Returns a list of raw dicts, or
+    None if the Bulk API isn't available (not activated, plan error, etc.)."""
+    response = request_with_retry(
+        "GET", config.EODHD_BULK_URL,
+        params={"api_token": config.EODHD_API_KEY, "fmt": "json"},
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "Bulk prices endpoint returned %d, treating Bulk API as unavailable: %s",
+            response.status_code, response.text[:200],
+        )
+        return None
+    return response.json()
 
 
-def _chunk(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
-
-
-def _fetch_bars_page(tickers, trade_date_str, page_token=None):
-    params = {
-        "symbols": ",".join(tickers),
-        "timeframe": "1Day",
-        "start": trade_date_str,
-        "end": trade_date_str,
-        "feed": "iex",
-        "adjustment": "raw",
-        "limit": 10000,
-    }
-    if page_token:
-        params["page_token"] = page_token
-    return request_with_retry("GET", config.ALPACA_BARS_URL, headers=_HEADERS, params=params)
-
-
-def _fetch_bars_for_batch(tickers, trade_date_str, errored_tickers):
-    """Fetch bars for a batch of tickers, bisecting on 400 to isolate bad tickers.
-
-    Returns {ticker: bar_dict}.
-    """
-    if not tickers:
-        return {}
-
-    bars_by_ticker = {}
-    page_token = None
-    while True:
-        response = _fetch_bars_page(tickers, trade_date_str, page_token)
-
-        if response.status_code == 400:
-            if len(tickers) == 1:
-                logger.warning(
-                    "Bars request failed (400) for ticker %s, skipping: %s",
-                    tickers[0], response.text[:200],
-                )
-                errored_tickers.append(tickers[0])
-                return bars_by_ticker
-            mid = len(tickers) // 2
-            logger.info("Bars batch of %d returned 400, bisecting to isolate bad ticker(s)", len(tickers))
-            bars_by_ticker.update(_fetch_bars_for_batch(tickers[:mid], trade_date_str, errored_tickers))
-            bars_by_ticker.update(_fetch_bars_for_batch(tickers[mid:], trade_date_str, errored_tickers))
-            return bars_by_ticker
-
-        response.raise_for_status()
-        payload = response.json()
-        for ticker, bars in (payload.get("bars") or {}).items():
-            if bars:
-                bars_by_ticker[ticker] = bars[0]
-
-        page_token = payload.get("next_page_token")
-        if not page_token:
-            break
-        time.sleep(config.REQUEST_DELAY_SECONDS)
-
-    return bars_by_ticker
+def _fetch_prices_for_symbol(ticker, from_date_str):
+    """Fetch the last few days of EOD bars for one ticker. Returns a list of raw dicts."""
+    url = config.EODHD_EOD_URL_TEMPLATE.format(ticker=ticker)
+    response = request_with_retry(
+        "GET", url,
+        params={
+            "api_token": config.EODHD_API_KEY,
+            "fmt": "json",
+            "period": "d",
+            "from": from_date_str,
+        },
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "EOD request failed (%d) for %s: %s", response.status_code, ticker, response.text[:200]
+        )
+        raise RuntimeError(f"EOD request failed ({response.status_code}) for {ticker}")
+    return response.json() or []
 
 
 def refresh_daily_prices(conn, active_symbols, trade_date: datetime.date = None) -> dict:
-    """Fetch today's bar for all active symbols and insert into daily_prices.
+    """Fetch the latest bar(s) for all active symbols and insert into daily_prices.
 
     active_symbols: list of {symbol_id, ticker, exchange_id} dicts.
     Returns summary dict: {bars_inserted, errored_tickers}.
     """
     trade_date = trade_date or eastern_today()
-    trade_date_str = trade_date.isoformat()
 
     ticker_to_symbol_id = {}
     for row in active_symbols:
@@ -99,35 +76,62 @@ def refresh_daily_prices(conn, active_symbols, trade_date: datetime.date = None)
             continue
         ticker_to_symbol_id[ticker] = row["symbol_id"]
 
-    tickers = sorted(ticker_to_symbol_id.keys())
-    batches = list(_chunk(tickers, config.BATCH_SIZE))
-    logger.info(
-        "Fetching daily bars for %d active tickers in %d batch(es) for %s",
-        len(tickers), len(batches), trade_date_str,
-    )
-
     errored_tickers = []
     price_rows = []
 
-    for batch_num, batch in enumerate(batches, start=1):
-        logger.info("Daily prices batch %d/%d (%d tickers)", batch_num, len(batches), len(batch))
-        bars = _fetch_bars_for_batch(batch, trade_date_str, errored_tickers)
-        for ticker, bar in bars.items():
-            symbol_id = ticker_to_symbol_id.get(ticker)
+    bulk_records = _fetch_bulk_prices()
+
+    if bulk_records is not None:
+        logger.info(
+            "Daily prices: using EODHD Bulk API (whole US market, 1 request); "
+            "%d active tickers to match against %d returned records",
+            len(ticker_to_symbol_id), len(bulk_records),
+        )
+        matched = 0
+        for rec in bulk_records:
+            symbol_id = ticker_to_symbol_id.get(rec.get("code"))
             if symbol_id is None:
                 continue
+            trade_date_str = rec.get("date")
+            close = rec.get("close")
+            if not trade_date_str or close is None:
+                continue
             price_rows.append(
-                (
-                    symbol_id,
-                    trade_date_str,
-                    bar.get("o"),
-                    bar.get("h"),
-                    bar.get("l"),
-                    bar.get("c"),
-                    bar.get("v"),
-                )
+                (symbol_id, trade_date_str, rec.get("open"), rec.get("high"), rec.get("low"), close, rec.get("volume"))
             )
-        time.sleep(config.REQUEST_DELAY_SECONDS)
+            matched += 1
+        logger.info("Daily prices: matched %d of %d active tickers in the bulk response", matched, len(ticker_to_symbol_id))
+    else:
+        tickers = sorted(ticker_to_symbol_id.keys())
+        from_date_str = (trade_date - datetime.timedelta(days=config.PRICE_LOOKBACK_DAYS)).isoformat()
+        logger.warning(
+            "Daily prices: Bulk API unavailable, falling back to per-symbol requests "
+            "(%d active tickers, %d workers, window since %s)",
+            len(tickers), config.FALLBACK_MAX_WORKERS, from_date_str,
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=config.FALLBACK_MAX_WORKERS) as pool:
+            futures = {
+                pool.submit(_fetch_prices_for_symbol, ticker, from_date_str): ticker
+                for ticker in tickers
+            }
+            for future in concurrent.futures.as_completed(futures):
+                ticker = futures[future]
+                try:
+                    bars = future.result()
+                except Exception:
+                    logger.exception("Daily prices fetch failed for %s", ticker)
+                    errored_tickers.append(ticker)
+                    continue
+                symbol_id = ticker_to_symbol_id[ticker]
+                for bar in bars:
+                    bar_date = bar.get("date")
+                    close = bar.get("close")
+                    if not bar_date or close is None:
+                        continue
+                    price_rows.append(
+                        (symbol_id, bar_date, bar.get("open"), bar.get("high"), bar.get("low"), close, bar.get("volume"))
+                    )
 
     bars_inserted = 0
     if price_rows:
@@ -145,10 +149,10 @@ def refresh_daily_prices(conn, active_symbols, trade_date: datetime.date = None)
 
     summary = {
         "bars_inserted": bars_inserted,
-        "errored_tickers": errored_tickers,
+        "errored_tickers": sorted(set(errored_tickers)),
     }
     logger.info(
         "Daily prices refresh complete: %d bars inserted, %d tickers errored",
-        bars_inserted, len(errored_tickers),
+        bars_inserted, len(summary["errored_tickers"]),
     )
     return summary

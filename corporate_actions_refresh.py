@@ -1,14 +1,23 @@
-"""Refresh `splits` and `dividends` from Alpaca's corporate actions endpoint.
+"""Refresh `splits` and `dividends` from EODHD.
 
-Queries a short recent window across all active symbols, batched to stay
-under request size limits. Some tickers with special characters (e.g.
-"CMS$C") make Alpaca return 400 for the whole batch -- when that happens we
-bisect the batch and retry each half, isolating down to the single bad
-ticker if needed, logging it, and continuing with everything else.
+Primary path: EODHD's Bulk API (`/api/eod-bulk-last-day/US`) with
+`type=splits` and `type=dividends`, covering the whole US market in two
+requests.
+
+Fallback path: if the Bulk API isn't activated on this account yet (a 403 or
+other plan-related error), loop over active symbols individually against
+`/api/splits/{ticker}.US` and `/api/div/{ticker}.US`, scoped to a short
+recent window, using a small thread pool. Whichever path runs is logged
+clearly.
+
+Dividends are stored using EODHD's `unadjustedValue` (falling back to
+`dividend`/`value` if that's ever missing), consistent with this project's
+raw-data-as-source-of-truth principle -- prices are stored raw and adjusted
+for splits at read time elsewhere, never by rewriting stored history.
 """
+import concurrent.futures
 import datetime
 import logging
-import time
 
 import psycopg2.extras
 
@@ -17,79 +26,62 @@ from http_utils import request_with_retry
 
 logger = logging.getLogger("chartist.corporate_actions")
 
-_HEADERS = {
-    "APCA-API-KEY-ID": config.ALPACA_API_KEY_ID,
-    "APCA-API-SECRET-KEY": config.ALPACA_API_SECRET_KEY,
-}
+
+def _parse_split_ratio(split_str):
+    """Parse EODHD's "new/old" split string (e.g. "4.000000/1.000000") into a
+    numeric ratio: 2.0 for a 2-for-1 split, 0.5 for a 1-for-2 reverse split."""
+    if not split_str:
+        return None
+    try:
+        new, old = split_str.split("/")
+        return float(new) / float(old)
+    except (ValueError, ZeroDivisionError):
+        return None
 
 
-def _chunk(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
-
-
-def _fetch_corporate_actions_page(tickers, types, start, end, page_token=None):
-    params = {
-        "symbols": ",".join(tickers),
-        "types": types,
-        "start": start,
-        "end": end,
-    }
-    if page_token:
-        params["page_token"] = page_token
-    return request_with_retry(
-        "GET", config.ALPACA_CORPORATE_ACTIONS_URL, headers=_HEADERS, params=params
+def _fetch_bulk(action_type):
+    """Fetch a bulk splits/dividends file. Returns a list of raw dicts, or
+    None if the Bulk API isn't available (not activated, plan error, etc.)."""
+    response = request_with_retry(
+        "GET", config.EODHD_BULK_URL,
+        params={"api_token": config.EODHD_API_KEY, "fmt": "json", "type": action_type},
     )
+    if response.status_code != 200:
+        logger.warning(
+            "Bulk %s endpoint returned %d, treating Bulk API as unavailable: %s",
+            action_type, response.status_code, response.text[:200],
+        )
+        return None
+    return response.json()
 
 
-def _fetch_corporate_actions_for_batch(tickers, types, start, end, errored_tickers):
-    """Fetch all pages of corporate actions for a batch of tickers.
+def _fetch_splits_for_symbol(ticker, from_date_str):
+    url = config.EODHD_SPLITS_URL_TEMPLATE.format(ticker=ticker)
+    response = request_with_retry(
+        "GET", url, params={"api_token": config.EODHD_API_KEY, "fmt": "json", "from": from_date_str}
+    )
+    if response.status_code != 200:
+        logger.warning("Splits request failed (%d) for %s: %s", response.status_code, ticker, response.text[:200])
+        raise RuntimeError(f"Splits request failed ({response.status_code}) for {ticker}")
+    return response.json() or []
 
-    On a 400, bisects the batch and retries each half recursively, isolating
-    single bad tickers (which get logged into errored_tickers and skipped).
-    Returns a list of raw record dicts merged across all action-type buckets.
-    """
-    if not tickers:
-        return []
 
-    records = []
-    page_token = None
-    while True:
-        response = _fetch_corporate_actions_page(tickers, types, start, end, page_token)
+def _fetch_dividends_for_symbol(ticker, from_date_str):
+    url = config.EODHD_DIVIDENDS_URL_TEMPLATE.format(ticker=ticker)
+    response = request_with_retry(
+        "GET", url, params={"api_token": config.EODHD_API_KEY, "fmt": "json", "from": from_date_str}
+    )
+    if response.status_code != 200:
+        logger.warning("Dividends request failed (%d) for %s: %s", response.status_code, ticker, response.text[:200])
+        raise RuntimeError(f"Dividends request failed ({response.status_code}) for {ticker}")
+    return response.json() or []
 
-        if response.status_code == 400:
-            if len(tickers) == 1:
-                logger.warning(
-                    "Corporate actions request failed (400) for ticker %s, skipping: %s",
-                    tickers[0], response.text[:200],
-                )
-                errored_tickers.append(tickers[0])
-                return records
-            mid = len(tickers) // 2
-            logger.info(
-                "Corporate actions batch of %d returned 400, bisecting to isolate bad ticker(s)",
-                len(tickers),
-            )
-            records.extend(
-                _fetch_corporate_actions_for_batch(tickers[:mid], types, start, end, errored_tickers)
-            )
-            records.extend(
-                _fetch_corporate_actions_for_batch(tickers[mid:], types, start, end, errored_tickers)
-            )
-            return records
 
-        response.raise_for_status()
-        payload = response.json()
-        actions = payload.get("corporate_actions", {})
-        for bucket in actions.values():
-            records.extend(bucket)
-
-        page_token = payload.get("next_page_token")
-        if not page_token:
-            break
-        time.sleep(config.REQUEST_DELAY_SECONDS)
-
-    return records
+def _unadjusted_dividend_amount(rec):
+    amount = rec.get("unadjustedValue")
+    if amount is None:
+        amount = rec.get("dividend", rec.get("value"))
+    return amount
 
 
 def refresh_corporate_actions(conn, active_symbols) -> dict:
@@ -109,57 +101,96 @@ def refresh_corporate_actions(conn, active_symbols) -> dict:
             continue
         ticker_to_symbol_id[ticker] = row["symbol_id"]
 
-    tickers = sorted(ticker_to_symbol_id.keys())
-    end = datetime.date.today()
-    start = end - datetime.timedelta(days=config.CORPORATE_ACTIONS_LOOKBACK_DAYS)
-    start_str, end_str = start.isoformat(), end.isoformat()
-
-    batches = list(_chunk(tickers, config.BATCH_SIZE))
-    logger.info(
-        "Fetching splits/dividends for %d active tickers in %d batch(es) (window %s to %s)",
-        len(tickers), len(batches), start_str, end_str,
-    )
-
     errored_tickers = []
     split_rows = []
     dividend_rows = []
 
-    for batch_num, batch in enumerate(batches, start=1):
-        logger.info("Corporate actions batch %d/%d (%d tickers)", batch_num, len(batches), len(batch))
-        split_records = _fetch_corporate_actions_for_batch(
-            batch, "forward_split,reverse_split", start_str, end_str, errored_tickers
+    bulk_splits = _fetch_bulk("splits")
+    bulk_dividends = _fetch_bulk("dividends")
+
+    if bulk_splits is not None and bulk_dividends is not None:
+        logger.info(
+            "Splits/dividends: using EODHD Bulk API (whole US market, 2 requests); "
+            "%d active tickers to match against %d split record(s) and %d dividend record(s)",
+            len(ticker_to_symbol_id), len(bulk_splits), len(bulk_dividends),
         )
-        for rec in split_records:
-            symbol_id = ticker_to_symbol_id.get(rec.get("symbol"))
+
+        for rec in bulk_splits:
+            symbol_id = ticker_to_symbol_id.get(rec.get("code"))
             if symbol_id is None:
                 continue
-            old_rate = rec.get("old_rate")
-            new_rate = rec.get("new_rate")
-            ex_date = rec.get("ex_date")
-            if not old_rate or not new_rate or not ex_date:
+            ratio = _parse_split_ratio(rec.get("split"))
+            ex_date = rec.get("date")
+            if ratio is None or not ex_date:
                 continue
-            ratio = float(new_rate) / float(old_rate)
             split_rows.append((symbol_id, ex_date, ratio))
-        time.sleep(config.REQUEST_DELAY_SECONDS)
 
-        dividend_records = _fetch_corporate_actions_for_batch(
-            batch, "cash_dividend", start_str, end_str, errored_tickers
-        )
-        for rec in dividend_records:
-            symbol_id = ticker_to_symbol_id.get(rec.get("symbol"))
+        for rec in bulk_dividends:
+            symbol_id = ticker_to_symbol_id.get(rec.get("code"))
             if symbol_id is None:
                 continue
-            rate = rec.get("rate")
-            ex_date = rec.get("ex_date")
-            if rate is None or not ex_date:
+            amount = _unadjusted_dividend_amount(rec)
+            ex_date = rec.get("date")
+            if amount is None or not ex_date:
                 continue
-            dividend_rows.append((symbol_id, ex_date, float(rate)))
-        time.sleep(config.REQUEST_DELAY_SECONDS)
+            dividend_rows.append((symbol_id, ex_date, float(amount)))
+    else:
+        tickers = sorted(ticker_to_symbol_id.keys())
+        end = datetime.date.today()
+        from_date_str = (end - datetime.timedelta(days=config.CORPORATE_ACTIONS_LOOKBACK_DAYS)).isoformat()
+        logger.warning(
+            "Splits/dividends: Bulk API unavailable, falling back to per-symbol requests "
+            "(%d active tickers, %d workers, window since %s)",
+            len(tickers), config.FALLBACK_MAX_WORKERS, from_date_str,
+        )
 
-    # Alpaca can return the same corporate action more than once (e.g. across
-    # overlapping pages), and ON CONFLICT DO UPDATE can't touch the same row
-    # twice within a single statement -- dedupe on the same key as the DB's
-    # unique constraint, keeping the last-seen record for each.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=config.FALLBACK_MAX_WORKERS) as pool:
+            futures = {
+                pool.submit(_fetch_splits_for_symbol, ticker, from_date_str): ticker
+                for ticker in tickers
+            }
+            for future in concurrent.futures.as_completed(futures):
+                ticker = futures[future]
+                try:
+                    records = future.result()
+                except Exception:
+                    logger.exception("Splits fetch failed for %s", ticker)
+                    errored_tickers.append(ticker)
+                    continue
+                symbol_id = ticker_to_symbol_id[ticker]
+                for rec in records:
+                    ratio = _parse_split_ratio(rec.get("split"))
+                    ex_date = rec.get("date")
+                    if ratio is None or not ex_date:
+                        continue
+                    split_rows.append((symbol_id, ex_date, ratio))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=config.FALLBACK_MAX_WORKERS) as pool:
+            futures = {
+                pool.submit(_fetch_dividends_for_symbol, ticker, from_date_str): ticker
+                for ticker in tickers
+            }
+            for future in concurrent.futures.as_completed(futures):
+                ticker = futures[future]
+                try:
+                    records = future.result()
+                except Exception:
+                    logger.exception("Dividends fetch failed for %s", ticker)
+                    errored_tickers.append(ticker)
+                    continue
+                symbol_id = ticker_to_symbol_id[ticker]
+                for rec in records:
+                    amount = _unadjusted_dividend_amount(rec)
+                    ex_date = rec.get("date")
+                    if amount is None or not ex_date:
+                        continue
+                    dividend_rows.append((symbol_id, ex_date, float(amount)))
+
+    # EODHD can return the same corporate action more than once (e.g. if a
+    # symbol appears twice, or bulk + per-symbol overlap during testing), and
+    # ON CONFLICT DO UPDATE can't touch the same row twice within a single
+    # statement -- dedupe on the same key as the DB's unique constraint,
+    # keeping the last-seen record for each.
     deduped_splits = {(symbol_id, ex_date): (symbol_id, ex_date, ratio) for symbol_id, ex_date, ratio in split_rows}
     deduped_dividends = {(symbol_id, ex_date): (symbol_id, ex_date, amount) for symbol_id, ex_date, amount in dividend_rows}
 
@@ -198,10 +229,10 @@ def refresh_corporate_actions(conn, active_symbols) -> dict:
     summary = {
         "splits_upserted": splits_upserted,
         "dividends_upserted": dividends_upserted,
-        "errored_tickers": errored_tickers,
+        "errored_tickers": sorted(set(errored_tickers)),
     }
     logger.info(
         "Corporate actions refresh complete: %d splits, %d dividends, %d tickers errored",
-        splits_upserted, dividends_upserted, len(errored_tickers),
+        splits_upserted, dividends_upserted, len(summary["errored_tickers"]),
     )
     return summary

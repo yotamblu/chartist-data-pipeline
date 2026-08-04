@@ -14,11 +14,14 @@ Each run, in order:
    upserts ticker/name/security_type for NASDAQ/NYSE/AMEX-listed stocks and
    ETFs, marks symbols that dropped out of the file as `delisted`, and
    inserts brand-new tickers as `active`.
-3. **Splits & dividends refresh** — pulls the last 7 days of corporate
-   actions from Alpaca for all active symbols (batched 100 tickers/request)
-   and upserts into `splits` / `dividends`.
-4. **Daily prices refresh** — pulls today's daily bar from Alpaca for all
-   active symbols and inserts into `daily_prices`.
+3. **Splits & dividends refresh** — pulls splits/dividends from EODHD: the
+   Bulk API first (whole US market, 2 requests), falling back to per-symbol
+   calls (last 7 days) for all active symbols if the Bulk API isn't active
+   on the account yet.
+4. **Daily prices refresh** — pulls the latest daily bar from EODHD: the
+   Bulk API first (whole US market, 1 request), falling back to per-symbol
+   calls (last 5 days) for all active symbols if the Bulk API isn't active
+   on the account yet.
 5. **Summary log** — symbols added/delisted, splits/dividends found, bars
    inserted, any tickers that errored out, and total runtime. Exits non-zero
    only if an entire step failed outright (individual skipped/errored
@@ -53,8 +56,7 @@ main.py                      orchestrates all of the above
    ```
 
    - `DATABASE_URL` — Postgres connection string for the existing Chartist DB.
-   - `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY` — Alpaca Market Data API
-     credentials.
+   - `EODHD_API_KEY` — EODHD API key (All World EOD plan).
 
    `.env` is loaded automatically via `python-dotenv` and is gitignored — never
    commit real secrets.
@@ -96,9 +98,8 @@ partial failure never creates duplicates or corrupts data:
 - Each of the three refresh steps runs in its own DB transaction/connection,
   so a failure in one step (e.g. prices) doesn't roll back or block the
   others, and the next run picks up cleanly.
-- Ticker-level errors (e.g. Alpaca 400s on tickers with special characters
-  like `CMS$C`) are isolated via batch-bisection, logged, and skipped —
-  they don't fail the whole step or the run.
+- Ticker-level errors in the per-symbol fallback paths are caught per
+  ticker, logged, and skipped — they don't fail the whole step or the run.
 
 ## GitHub Actions
 
@@ -113,11 +114,10 @@ trigger it manually from the Actions tab (`workflow_dispatch`).
 ### Configuring secrets
 
 In the GitHub repo, go to **Settings → Secrets and variables → Actions** and
-add three repository secrets with the same names used locally in `.env`:
+add repository secrets with the same names used locally in `.env`:
 
 - `DATABASE_URL`
-- `ALPACA_API_KEY_ID`
-- `ALPACA_API_SECRET_KEY`
+- `EODHD_API_KEY`
 
 The workflow passes these through as environment variables to `main.py`,
 exactly like `.env` does locally.

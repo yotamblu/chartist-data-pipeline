@@ -4,8 +4,8 @@ Order of operations:
 1. Check today is a NYSE trading day (exit 0, cleanly, if not -- unless
    --force is passed).
 2. Refresh `symbols` from the NASDAQ symbol directory.
-3. Refresh `splits` / `dividends` from Alpaca corporate actions.
-4. Refresh `daily_prices` with today's bar from Alpaca.
+3. Refresh `splits` / `dividends` from EODHD (bulk API, per-symbol fallback).
+4. Refresh `daily_prices` with today's bar from EODHD (bulk API, per-symbol fallback).
 5. Log a summary and exit non-zero only if an entire step failed outright.
 """
 import argparse
