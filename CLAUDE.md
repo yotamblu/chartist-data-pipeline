@@ -64,6 +64,46 @@ plan. Company profile data (name, sector, description, etc.) comes from
 Finnhub/FMP in the separate `chartist-api` backend, not from EODHD. Don't
 add fundamentals calls here expecting them to work on this plan.
 
+## New-symbol full history backfill (`price_backfill.py`)
+
+The regular daily prices step (`prices_refresh.py`) only ever fetches a
+short recent window (bulk = latest day, fallback = last 5 days) — fine for
+symbols that already have price history, but useless for a symbol that was
+just added and has zero rows in `daily_prices`. `price_backfill.py` exists
+to close that gap, and runs as its own explicit step between the
+splits/dividends refresh and the regular daily prices top-up, so it shows
+up as a distinct phase in the logs rather than being folded silently into
+the top-up.
+
+- **Detecting "new"**: the `symbols.prices_loaded_at` column already means
+  exactly "has this symbol's price history ever been loaded." A symbol
+  just inserted by the symbols refresh step naturally has
+  `prices_loaded_at = NULL`, so `db.get_symbols_needing_price_backfill`
+  (`WHERE status = 'active' AND prices_loaded_at IS NULL`) is the only
+  signal needed — there's no separate "is this new" tracking to maintain.
+- **Always per-symbol, never bulk**: the Bulk API only ever returns the
+  most recent single day and structurally cannot backfill history, so this
+  step always calls `/api/eod/{ticker}.US` with `from=2000-01-01`. It reuses
+  the same thread pool + jittered backoff as the other per-symbol EODHD
+  fallback paths — full-history payloads are slow (~7s/symbol is normal,
+  not a bug), so fetches run concurrently.
+- **Chunked commits are load-bearing, not an optional nicety.** Inserts for
+  each symbol's full history commit in small chunks (`INSERT_CHUNK_SIZE =
+  150` rows), never as one multi-year transaction. A multi-year history
+  spans many TimescaleDB hypertable chunks, and accumulating locks across
+  all of them in a single uncommitted transaction caused "out of shared
+  memory" errors on Aiven in an earlier version of this backfill. **If a
+  future change "simplifies" this back into one big INSERT per symbol, it
+  will reintroduce that bug** — don't do it, even though it looks like dead
+  weight for a symbol with only a few years of history.
+- **On failure, `prices_loaded_at` stays NULL** — no separate retry
+  tracking. The symbol just gets picked up again by the same query on the
+  next nightly run. Because chunk inserts use `ON CONFLICT DO NOTHING`,
+  re-running a partially-backfilled symbol is safe and idempotent (some
+  chunks re-insert as no-ops, the rest fill in).
+- `prices_loaded_at` is only set (`db.mark_prices_loaded`, `now()`) after
+  all chunks for a symbol have been stored successfully.
+
 ## What doesn't change often
 
 - **Trading-day check** (`trading_day.py`) uses `pandas_market_calendars`

@@ -18,14 +18,20 @@ Each run, in order:
    Bulk API first (whole US market, 2 requests), falling back to per-symbol
    calls (last 7 days) for all active symbols if the Bulk API isn't active
    on the account yet.
-4. **Daily prices refresh** — pulls the latest daily bar from EODHD: the
+4. **New symbol price backfill** — for any symbol with `prices_loaded_at IS
+   NULL` (i.e. never had its price history loaded, which any brand-new
+   symbol naturally starts out as), fetches its *full* history from EODHD's
+   per-symbol endpoint and sets `prices_loaded_at` once stored. Runs as its
+   own step, distinct from the regular top-up, since a new symbol has no
+   existing rows and a short recent window wouldn't be enough for it.
+5. **Daily prices refresh** — pulls the latest daily bar from EODHD: the
    Bulk API first (whole US market, 1 request), falling back to per-symbol
    calls (last 5 days) for all active symbols if the Bulk API isn't active
    on the account yet.
-5. **Summary log** — symbols added/delisted, splits/dividends found, bars
-   inserted, any tickers that errored out, and total runtime. Exits non-zero
-   only if an entire step failed outright (individual skipped/errored
-   tickers are expected and don't fail the run).
+6. **Summary log** — symbols added/delisted, splits/dividends found, new
+   symbols backfilled, bars inserted, any tickers that errored out, and
+   total runtime. Exits non-zero only if an entire step failed outright
+   (individual skipped/errored tickers are expected and don't fail the run).
 
 ## Project layout
 
@@ -36,7 +42,8 @@ http_utils.py                HTTP retry/backoff (429s, 5xx)
 trading_day.py                NYSE trading-day check
 symbols_refresh.py           step 2
 corporate_actions_refresh.py step 3
-prices_refresh.py            step 4
+price_backfill.py            step 4 (full history for brand-new symbols)
+prices_refresh.py            step 5
 main.py                      orchestrates all of the above
 .github/workflows/nightly-ingestion.yml
 ```
@@ -68,7 +75,7 @@ python main.py
 ```
 
 Logs go to stdout with timestamps. On a non-trading day it logs that and
-exits `0` without touching anything else. On a trading day it runs all four
+exits `0` without touching anything else. On a trading day it runs all five
 steps and prints a summary at the end.
 
 To run the refresh regardless of whether today is a NYSE trading day
@@ -79,7 +86,7 @@ python main.py --force
 ```
 
 This only bypasses the trading-day check — it logs a warning that it's
-running out-of-band, then runs the same four steps as normal.
+running out-of-band, then runs the same five steps as normal.
 
 ## Why it's safe to re-run
 
@@ -95,9 +102,14 @@ partial failure never creates duplicates or corrupts data:
   with the same values.
 - **Daily prices**: unique on `(symbol_id, trade_date)`, `ON CONFLICT DO
   NOTHING` — a second run for the same day is a no-op once the bar exists.
-- Each of the three refresh steps runs in its own DB transaction/connection,
-  so a failure in one step (e.g. prices) doesn't roll back or block the
-  others, and the next run picks up cleanly.
+- **New symbol backfill**: same `ON CONFLICT DO NOTHING` on `daily_prices`,
+  plus `prices_loaded_at` is only set after a symbol's full history is
+  successfully stored — a symbol that fails partway through is naturally
+  retried on the next run (no separate retry tracking needed), and
+  re-inserting already-stored chunks is a no-op.
+- Each of the refresh steps runs in its own DB transaction/connection, so a
+  failure in one step (e.g. prices) doesn't roll back or block the others,
+  and the next run picks up cleanly.
 - Ticker-level errors in the per-symbol fallback paths are caught per
   ticker, logged, and skipped — they don't fail the whole step or the run.
 

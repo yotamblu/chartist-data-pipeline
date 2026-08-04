@@ -5,8 +5,11 @@ Order of operations:
    --force is passed).
 2. Refresh `symbols` from the NASDAQ symbol directory.
 3. Refresh `splits` / `dividends` from EODHD (bulk API, per-symbol fallback).
-4. Refresh `daily_prices` with today's bar from EODHD (bulk API, per-symbol fallback).
-5. Log a summary and exit non-zero only if an entire step failed outright.
+4. Backfill full price history for any brand-new symbols (prices_loaded_at
+   IS NULL) -- the regular top-up in step 5 only ever fetches a short
+   recent window, which isn't enough for a symbol with no rows yet.
+5. Refresh `daily_prices` with today's bar from EODHD (bulk API, per-symbol fallback).
+6. Log a summary and exit non-zero only if an entire step failed outright.
 """
 import argparse
 import sys
@@ -15,6 +18,7 @@ import time
 import config
 import db
 from corporate_actions_refresh import refresh_corporate_actions
+from price_backfill import backfill_new_symbols
 from prices_refresh import refresh_daily_prices
 from symbols_refresh import refresh_symbols
 from trading_day import eastern_today, is_trading_day
@@ -58,10 +62,11 @@ def main(argv=None) -> int:
 
     symbol_summary = {"added": 0, "delisted": 0, "total_in_file": 0}
     corp_actions_summary = {"splits_upserted": 0, "dividends_upserted": 0, "errored_tickers": []}
+    backfill_summary = {"symbols_backfilled": 0, "bars_inserted": 0, "errored_tickers": []}
     prices_summary = {"bars_inserted": 0, "errored_tickers": []}
     failed_steps = []
 
-    logger.info("Step 1/3: refreshing symbols...")
+    logger.info("Step 1/4: refreshing symbols...")
     try:
         with db.get_connection() as conn:
             symbol_summary = refresh_symbols(conn)
@@ -69,7 +74,7 @@ def main(argv=None) -> int:
         logger.exception("Symbol refresh step failed outright")
         failed_steps.append("symbols")
 
-    logger.info("Step 2/3: refreshing splits/dividends...")
+    logger.info("Step 2/4: refreshing splits/dividends...")
     try:
         with db.get_connection() as conn:
             active_symbols = db.get_active_symbols(conn)
@@ -78,7 +83,16 @@ def main(argv=None) -> int:
         logger.exception("Corporate actions refresh step failed outright")
         failed_steps.append("corporate_actions")
 
-    logger.info("Step 3/3: refreshing daily prices...")
+    logger.info("Step 3/4: backfilling full price history for new symbols...")
+    try:
+        with db.get_connection() as conn:
+            new_symbols = db.get_symbols_needing_price_backfill(conn)
+            backfill_summary = backfill_new_symbols(conn, new_symbols)
+    except Exception:
+        logger.exception("New symbol price backfill step failed outright")
+        failed_steps.append("price_backfill")
+
+    logger.info("Step 4/4: refreshing daily prices...")
     try:
         with db.get_connection() as conn:
             active_symbols = db.get_active_symbols(conn)
@@ -90,23 +104,27 @@ def main(argv=None) -> int:
     elapsed = time.monotonic() - start_time
     all_errored_tickers = sorted(
         set(corp_actions_summary.get("errored_tickers", []))
+        | set(backfill_summary.get("errored_tickers", []))
         | set(prices_summary.get("errored_tickers", []))
     )
 
     logger.info(
         "=== Nightly ingestion summary ===\n"
-        "  Symbols added:      %d\n"
-        "  Symbols delisted:   %d\n"
-        "  Splits found:       %d\n"
-        "  Dividends found:    %d\n"
-        "  Price bars inserted:%d\n"
-        "  Tickers errored:    %d%s\n"
-        "  Steps failed:       %s\n"
-        "  Runtime:            %.1fs",
+        "  Symbols added:         %d\n"
+        "  Symbols delisted:      %d\n"
+        "  Splits found:          %d\n"
+        "  Dividends found:       %d\n"
+        "  New symbols backfilled:%d (%d bars)\n"
+        "  Price bars inserted:   %d\n"
+        "  Tickers errored:       %d%s\n"
+        "  Steps failed:          %s\n"
+        "  Runtime:               %.1fs",
         symbol_summary.get("added", 0),
         symbol_summary.get("delisted", 0),
         corp_actions_summary.get("splits_upserted", 0),
         corp_actions_summary.get("dividends_upserted", 0),
+        backfill_summary.get("symbols_backfilled", 0),
+        backfill_summary.get("bars_inserted", 0),
         prices_summary.get("bars_inserted", 0),
         len(all_errored_tickers),
         f" ({', '.join(all_errored_tickers)})" if all_errored_tickers else "",
