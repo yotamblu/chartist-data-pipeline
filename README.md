@@ -11,9 +11,9 @@ Each run, in order:
 1. **Trading day check** — uses `pandas_market_calendars` to confirm today is
    a NYSE trading day. If not (weekend/holiday), logs that and exits `0`.
 2. **Symbol refresh** — downloads the NASDAQ Trader symbol directory,
-   upserts ticker/name/security_type for NASDAQ/NYSE/AMEX-listed stocks and
-   ETFs, marks symbols that dropped out of the file as `delisted`, and
-   inserts brand-new tickers as `active`.
+   upserts ticker/name/security_type for NASDAQ/NYSE/AMEX/ARCA-listed
+   stocks and ETFs, marks symbols that dropped out of the file as
+   `delisted`, and inserts brand-new tickers as `active`.
 3. **Splits & dividends refresh** — pulls splits/dividends from EODHD: the
    Bulk API first (whole US market, 2 requests), falling back to per-symbol
    calls (last 7 days) for all active symbols if the Bulk API isn't active

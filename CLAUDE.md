@@ -113,9 +113,18 @@ the top-up.
 - **Symbols refresh** (`symbols_refresh.py`) has nothing to do with the
   price data provider — it's driven entirely by the NASDAQ Trader symbol
   directory file, independent of Alpaca/EODHD/whatever else prices come
-  from. It filters to Listing Exchange Q/N/A (NASDAQ/NYSE/AMEX), skips test
-  issues, and skips tickers with special characters (preferred shares,
-  warrants, units are intentionally excluded from this project's universe).
+  from. It filters to Listing Exchange Q/N/A/P (NASDAQ/NYSE/AMEX/ARCA),
+  skips test issues, and skips tickers with special characters (preferred
+  shares, warrants, units are intentionally excluded from this project's
+  universe). `config.EXCHANGE_CODE_MAP` is the single source of truth for
+  which Listing Exchange codes are in scope -- a code missing from that map
+  silently drops every ticker on that exchange out of the file on the very
+  next run, which reads as a mass "delisting" even though nothing actually
+  changed on the exchange (this happened for real with ARCA/"P" -- it was
+  never in the map from the initial commit onward, so every ARCA-listed
+  symbol looked delisted until the map was fixed). When adding a new
+  exchange to the universe, update both `EXCHANGE_CODE_MAP` and
+  `_ensure_exchanges` in `symbols_refresh.py` together.
 - **Idempotent writes everywhere.** Every write is an upsert or a
   conditional update (`ON CONFLICT ... DO UPDATE` / `DO NOTHING`) because
   this job sometimes fails partway through and gets re-run. Any new write

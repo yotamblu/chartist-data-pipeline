@@ -28,6 +28,7 @@ EXCHANGE_CODE_MAP = {
     "Q": "NASDAQ",
     "N": "NYSE",
     "A": "AMEX",
+    "P": "ARCA",
 }
 
 MAX_RETRIES = 5

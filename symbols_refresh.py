@@ -1,6 +1,6 @@
 """Refresh the `symbols` table from the NASDAQ Trader symbol directory file.
 
-Downloads the full listing of NASDAQ/NYSE/AMEX-listed tickers, upserts
+Downloads the full listing of NASDAQ/NYSE/AMEX/ARCA-listed tickers, upserts
 name/security_type for anything present, marks previously-active symbols
 that dropped out of the file as delisted, and inserts brand new tickers
 as active.
@@ -82,7 +82,12 @@ def _parse_nasdaq_file(text: str):
 def _ensure_exchanges(conn):
     """Make sure the exchanges we need exist, returning {code: exchange_id}."""
     with conn.cursor() as cur:
-        for code, name in (("NASDAQ", "Nasdaq"), ("NYSE", "New York Stock Exchange"), ("AMEX", "NYSE American")):
+        for code, name in (
+            ("NASDAQ", "Nasdaq"),
+            ("NYSE", "New York Stock Exchange"),
+            ("AMEX", "NYSE American"),
+            ("ARCA", "NYSE Arca"),
+        ):
             cur.execute(
                 """
                 INSERT INTO exchanges (code, name)
@@ -105,7 +110,7 @@ def refresh_symbols(conn) -> dict:
     response.raise_for_status()
 
     rows = _parse_nasdaq_file(response.text)
-    logger.info("Parsed %d symbols from NASDAQ/NYSE/AMEX after filtering", len(rows))
+    logger.info("Parsed %d symbols from NASDAQ/NYSE/AMEX/ARCA after filtering", len(rows))
 
     exchange_ids = _ensure_exchanges(conn)
 
